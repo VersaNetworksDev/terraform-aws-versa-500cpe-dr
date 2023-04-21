@@ -1,0 +1,288 @@
+#cloud-config
+cloud_init_modules:
+  - write-files
+  - set_hostname
+  - update_hostname
+  - users-groups
+  - ssh
+hostname: DR-ROUTER
+write_files:
+- content: |
+    interfaces {
+        vni-0/0 {
+            description South_Bound_Network;
+            enable      true;
+            unit 0 {
+                description "South Bound Network connecting to Director and Analytics";
+                enable      true;
+                family {
+                    inet {
+                        address ${South_Bound_Network_ip}/24;
+                    }
+                }
+            }
+        }
+        vni-0/1 {
+            description Internet_Transport;
+            enable      true;
+            unit 0 {
+                description "WAN Network connecting to Internet cloud";
+                enable      true;
+                family {
+                    inet {
+                        address ${internet_interface_ip}/24;
+                    }
+                }
+            }
+        }
+        vni-0/2 {
+            description DR_DC_NETWORK_CONNECT;
+            enable      true;
+            unit 0 {
+                description "DR_DC Network connect";
+                enable      true;
+                family {
+                    inet {
+                        address ${DR_DC_NETWORK_CONNECT}/24;
+                    }
+                }
+            }
+        }
+        tvi-0/1 {
+            enable true;
+            mtu    1400;
+            mode   ipsec;
+            type   ipsec;
+            unit 0 {
+                enable true;
+                family {
+                    inet {
+                        address 192.168.0.2/30;
+                    }
+                }
+            }
+        }
+    }
+    networks {
+        ipsec {
+            interfaces [ vni-0/1.0 ];
+        }
+    }
+    orgs {
+        org ${parent_org_name} {
+            available-routing-instances   [ Internet vpc-gateway ];
+            owned-routing-instances       [ Internet vpc-gateway ];
+            options {
+                session-limit 1000000;
+            }
+            traffic-identification {
+                using          [ tvi-0/1.0 vni-0/0.0 vni-0/2.0 ];
+                using-networks [ ipsec ];
+            }
+            available-service-node-groups [ default-sng ];
+        }
+        org-services ${parent_org_name} {
+            ipsec {
+                vpn-profile transport-ipsec {
+                    vpn-type                site-to-site;
+                    local-auth-info {
+                        auth-type psk;
+                        id-type   ip;
+                        key       versa1234;
+                        id-string ${internet_interface_ip};
+                    }
+                    local {
+                        address ${internet_interface_ip};
+                    }
+                    routing-instance        Internet;
+                    tunnel-routing-instance vpc-gateway;
+                    tunnel-initiate         automatic;
+                    ipsec {
+                        fragmentation pre-fragmentation;
+                        force-nat-t   disable;
+                        transform     esp-aes128-sha1;
+                        mode          tunnel;
+                        pfs-group     mod-none;
+                        anti-replay   enable;
+                        life {
+                            duration 28800;
+                        }
+                    }
+                    ike {
+                        version     v2;
+                        group       mod2;
+                        transform   aes128-sha1;
+                        lifetime    28800;
+                        dpd-timeout 30;
+                    }
+                    peer-auth-info {
+                        auth-type psk;
+                        id-type   ip;
+                        key       versa1234;
+                        id-string ${DC_internet_private_IP};
+                    }
+                    peer {
+                        address [ ${DC_internet_public_IP} ];
+                    }
+                    tunnel-interface        tvi-0/1.0;
+                    hardware-accelerator    any;
+                }
+            }
+            objects {
+                zones {
+                    trust;
+                    untrust;
+                    host;
+                }
+            }
+        }
+    }
+    routing-instances {
+        Internet {
+            instance-type virtual-router;
+            networks      [ ipsec ];
+            routing-options {
+                static {
+                    route {
+                        0.0.0.0/0 ${DR_internet_subnet_gateway} none {
+                            preference 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        vpc-gateway {
+            instance-type virtual-router;
+            policy-options {
+                redistribution-policy policy-1 {
+                    term t1-direct {
+                        match {
+                            protocol direct;
+                        }
+                        action {
+                                      accept;
+                            set-origin igp;
+                        }
+                    }
+                    term t2-bgp {
+                        match {
+                            protocol bgp;
+                        }
+                        action {
+                                      accept;
+                            set-origin igp;
+                        }
+                    }
+                }
+                redistribute-to-bgp policy-1;
+            }
+            interfaces    [ tvi-0/1.0 vni-0/0.0 vni-0/2.0 ];
+            protocols {
+                bgp {
+                    64002 {
+                        family {
+                            inet {
+                                unicast;
+                            }
+                        }
+                        route-flap {
+                            free-max-time    180;
+                            reuse-max-time   60;
+                            reuse-size       256;
+                            reuse-array-size 1024;
+                        }
+                        graceful-restart {
+                            maximum-restart-time 120;
+                            recovery-time        120;
+                            select-defer-time    120;
+                            stalepath-time       120;
+                        }
+                        router-id ${South_Bound_Network_ip};
+                        local-as {
+                            as-number 64002;
+                        }
+                        group VPC {
+                            type internal;
+                            neighbor 192.168.0.1 {
+                                local-address 192.168.0.2;
+                                local-as      64002;
+                                peer-as       64002;
+                            }
+                        }
+                        group controller-2 {
+                            type external;
+                            neighbor ${controller_2_south_bound_ip} {
+                                local-address ${South_Bound_Network_ip};
+                                local-as      64002;
+                                peer-as       64512;
+                            }
+                        }                          
+                    }
+                }
+            }
+        }
+    }
+    service-node-groups {
+        default-sng {
+            id       0;
+            type     internal;
+            services [ cgnat ipsec sdwan ];
+        }
+    }
+    system {
+        session {
+            timeout-hard               0;
+            timeout-udp                30;
+            timeout-tcp                240;
+            timeout-icmp               10;
+            timeout-tcpwait            20;
+            timeout-default            30;
+            check-tcp-syn              false;
+            reevaluate-reverse-flow    false;
+            session-reevaluate         true;
+            tcp-send-reset             true;
+            tcp-secure-reset           false;
+            tcp-adjust-mss {
+                enable          true;
+                interface-types all;
+                mss             1200;
+            }
+            send-icmp-unreachable      false;
+            allow-unsupported-protocol false;
+            session-purge-batch-size   5;
+            interim-update {
+                disable false;
+            }
+        }
+    } 
+  path: /tmp/dr_dc_network_connect.cfg   
+- content: |
+    #writen by cloud-init write-files module
+    auto lo
+    auto eth0
+    iface lo inet loopback
+    iface eth0 inet dhcp
+      post-up route add -net ${DC_mgmt_subnet} gw ${DR_DC_NETWORK_CONNECT}
+  path: /etc/network/interfaces   
+- content: |
+    #!/bin/bash
+    sleep 1m
+    echo -e 'configure\nload merge /tmp/dr_dc_network_connect.cfg\ncommit' | /opt/versa/confd/bin/confd_cli -u admin -g admin
+    sleep 1.5m
+    internet_gw_ip=$(echo 'show arp routing-instance Internet ' | /opt/versa/confd/bin/confd_cli -u admin -g admin | grep remote | awk  '{print $2}')
+    echo -e "configure\nset routing-instances Internet routing-options static route 0.0.0.0/0 $internet_gw_ip none preference 1\ncommit" | /opt/versa/confd/bin/confd_cli -u admin -g admin    
+  path: /tmp/dr_dc_network_connect.sh
+  permissions : '755'      
+cloud_final_modules:
+- runcmd
+- scripts-user
+runcmd:
+- sed -i.bak "\$a\Match Address ${master_dir_mgmt_ip}/32\n  PasswordAuthentication yes\nMatch all" /etc/ssh/sshd_config
+- sed -i.bak "\$a\Match Address ${master_dir_south_bound_ip}/32\n  PasswordAuthentication yes\nMatch all" /etc/ssh/sshd_config
+- sed -i.bak "\$a\Match Address ${slave_dir_mgmt_ip}/32\n  PasswordAuthentication yes\nMatch all" /etc/ssh/sshd_config
+- sed -i.bak "\$a\Match Address ${slave_dir_south_bound_ip}/32\n  PasswordAuthentication yes\nMatch all" /etc/ssh/sshd_config
+- sudo service ssh restart
+- sudo route add -net ${DC_mgmt_subnet} gw ${DR_DC_NETWORK_CONNECT}
+- cd /tmp
+- ./dr_dc_network_connect.sh 
